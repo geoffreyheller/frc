@@ -1,4 +1,4 @@
-# Dependencies
+# Before you can run this script, you need to install the following dependencies:
 # pip install robotpy-wpiutil
 # pip install git+https://github.com/ligerbots/dslogparser@updateTo2026
 # pip install -U google-genai
@@ -13,12 +13,39 @@ import argparse
 from google import genai
 from wpiutil.log import DataLogReader
 import struct
+from dslogparser import DSLogParser
 
 
 # not sure if this is needed
 #model = genai.GenerativeModel('gemini-pro')
 
 # --- DSLog Parsing Logic ---
+def _dslog_power_snapshot(rec: dict) -> dict:
+    """
+    Collect all power-related fields exposed by dslogparser for one DSLog record.
+    (Battery voltage is kept at the event level as battery_voltage.)
+    """
+    currents = rec.get("pd_currents")
+    out = {
+        "pd_id": rec.get("pd_id"),
+        "pd_type": rec.get("pd_type"),
+        "pd_currents": [round(float(a), 2) for a in (currents or [])],
+        "pd_total_current": round(float(rec.get("pd_total_current", 0.0)), 2),
+    }
+    # Legacy CTRE PDP (DSLog v3): encoded auxiliary telemetry from the PDP block.
+    if "pd_resistance" in rec:
+        out["pd_resistance"] = rec.get("pd_resistance")
+    if "pd_voltage" in rec:
+        out["pd_voltage"] = rec.get("pd_voltage")
+    if "pd_temp" in rec:
+        out["pd_temp"] = rec.get("pd_temp")
+    # Robot mode affects whether outputs are commanded (context for current draw).
+    out["robot_disabled"] = bool(rec.get("robot_disabled", False))
+    out["robot_auto"] = bool(rec.get("robot_auto", False))
+    out["robot_tele"] = bool(rec.get("robot_tele", False))
+    return out
+
+
 def parse_dslog(file_path: str, voltage_threshold: float = 6.3):
     """
     Analyzes an FRC DS log file for brownout-style events.
@@ -51,11 +78,12 @@ def parse_dslog(file_path: str, voltage_threshold: float = 6.3):
                     if prev is not None and (float(round_trip_ms) - float(prev)) < 0.5:
                         continue
 
-            pd_currents = rec.get("pd_currents", [])
+            power = _dslog_power_snapshot(rec)
+            pd_currents_raw = rec.get("pd_currents") or []
             significant_loads = {}
-            for idx, amps in enumerate(pd_currents):
+            for idx, amps in enumerate(pd_currents_raw):
                 if amps > 15.0:
-                    significant_loads[f"PDP:{idx}"] = round(amps, 2)
+                    significant_loads[f"channel_{idx}"] = round(float(amps), 2)
 
             brownout_events.append({
                 "timestamp": timestamp_str,
@@ -66,7 +94,8 @@ def parse_dslog(file_path: str, voltage_threshold: float = 6.3):
                 "can_usage": round(float(rec.get("can_usage", 0.0)), 3),
                 "packet_loss": round(float(rec.get("packet_loss", 0.0)), 3),
                 "brownout_flag": is_brownout,
-                "total_current": round(float(rec.get("pd_total_current", 0.0)), 2),
+                "total_current": power["pd_total_current"],
+                **power,
                 "significant_loads": significant_loads,
             })
     finally:
