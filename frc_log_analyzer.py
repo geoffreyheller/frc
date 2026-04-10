@@ -1,8 +1,6 @@
 # Dependencies
 # pip install robotpy-wpiutil
-# DO NOT USE pip install dslogparser -- it is obsolete.  Use 
 # pip install git+https://github.com/ligerbots/dslogparser@updateTo2026
-# 
 # pip install -U google-genai
 #
 # usage:
@@ -16,14 +14,8 @@ from google import genai
 from wpiutil.log import DataLogReader
 import struct
 
-# Allow importing DSLogParser from the local child directory.
-# sys.path.insert(0, os.path.join(os.path.dirname(__file__), "dslogparser"))
-# from dslogparser import DSLogParser
 
-
-
-# Import the analyze function from the previous step or include it here
-
+# not sure if this is needed
 #model = genai.GenerativeModel('gemini-pro')
 
 # --- DSLog Parsing Logic ---
@@ -160,16 +152,33 @@ def parse_wpilog(file_path: str, voltage_threshold: float = 6.3):
 
 def get_gemini_diagnosis(log_data):
     """
-    Sends brownout data to Gemini using the new google-genai SDK.
+    Sends brownout data to Gemini using the google-genai SDK.
     """
     # Initialize the client. 
     # It automatically looks for the GEMINI_API_KEY environment variable.
     client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
 
     prompt_content = f"""
-    Act as a Lead FRC Control Systems Engineer. Analyze these brownout events 
-    from a .wpilog file. For each event, provide a "Root Cause Analysis" 
-    and a "Suggested Mechanical, Electrical or Software Fix."
+    Role: Act as a Lead FRC Control Systems Engineer and Mechanical Mentor. Your goal is to diagnose robot "brownouts" (voltage drops) from telemetry data.
+
+    Context:
+
+    Brownout Limit: The roboRIO disables motor outputs at 6.3V.
+
+    Battery Health: A healthy, fully charged battery stays above 12V at rest and shouldn't dip below 7V under a standard 100A load.
+
+    The Data: I will provide a JSON list of "Brownout Events" containing timestamps, voltage, and a list of "Significant Loads" (motor controllers drawing >15A at the time of the dip).
+
+    Diagnosis Logic:
+
+    Stall Detection: If one or two motors (e.g., Drivetrain or Intake) have extremely high current (>40A each) during a voltage drop, suggest a mechanical stall or "pushing match."
+
+    Battery Health: If the TotalCurrent is relatively low (<80A) but the voltage is still dropping below 6.5V, suggest the battery is end-of-life or has high internal resistance.
+
+    Wiring Check: If the voltage recovery is slow, suggest checking the battery terminal tightness or the main 120A breaker.
+
+    Task:
+    Analyze the following log data. For each event, provide a 1-2 sentence "Root Cause Analysis" and a "Suggested Mechanical, Electrical or Software Fix."
 
     Data:
     {json.dumps(log_data, indent=2)}
