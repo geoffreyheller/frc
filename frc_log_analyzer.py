@@ -5,31 +5,99 @@
 #
 # usage:
 # python frc_log_analyzer.py <log file>
+# python frc_log_analyzer.py match.dslog --dslog-profile dslogprofiles22.xml
+# python frc_log_analyzer.py match.dslog --dslog-profile dslogprofiles22.xml --profile-name Arrakis
 
 import os
 import sys
 import json
 import argparse
+import re
+import xml.etree.ElementTree as ET
 from google import genai
 from wpiutil.log import DataLogReader
 import struct
 from dslogparser import DSLogParser
 
+_PDP_NAME_RE = re.compile(r"^pdp(\d+)$", re.IGNORECASE)
+
 
 # not sure if this is needed
 #model = genai.GenerativeModel('gemini-pro')
 
+def load_dslog_profile_channel_names(
+    profile_path: str, profile_name: str | None = None
+) -> dict[int, str]:
+    """
+    Parse a Driver Station dslogprofiles XML (e.g. dslogprofiles22.xml).
+    Returns mapping PDP channel index -> SeriesChildNode Name (e.g. 0 -> "pdp0").
+    Only nodes whose Name matches pdp<N> are included; totals like total0 are ignored.
+    If profile_name is set, selects the GroupProfile with matching <Name>; otherwise
+    uses the first GroupProfile in the file.
+    """
+    tree = ET.parse(profile_path)
+    root = tree.getroot()
+    profiles = root.findall("GroupProfile")
+    if not profiles:
+        return {}
+    chosen = None
+    if profile_name is not None:
+        for gp in profiles:
+            n = gp.findtext("Name", default="")
+            if (n or "").strip() == profile_name.strip():
+                chosen = gp
+                break
+        if chosen is None:
+            raise ValueError(
+                f"No GroupProfile named {profile_name!r} in {profile_path!r}"
+            )
+    else:
+        chosen = profiles[0]
+
+    out: dict[int, str] = {}
+    groups = chosen.find("Groups")
+    if groups is None:
+        return out
+    for group in groups.findall("SeriesGroupNode"):
+        # Driver Station XML uses the typo "Childern".
+        for child in group.findall("Childern/SeriesChildNode"):
+            name_el = child.find("Name")
+            if name_el is None or name_el.text is None:
+                continue
+            name = name_el.text.strip()
+            m = _PDP_NAME_RE.match(name)
+            if not m:
+                continue
+            ch = int(m.group(1))
+            if ch not in out:
+                out[ch] = name
+    return out
+
+
+def _channel_label(profile_index_to_name: dict[int, str] | None, idx: int) -> str:
+    """JSON key for PDP channel idx: profile Name (e.g. pdp0) when present, else pdp<N>."""
+    if profile_index_to_name and idx in profile_index_to_name:
+        return profile_index_to_name[idx]
+    return f"pdp{idx}"
+
+
 # --- DSLog Parsing Logic ---
-def _dslog_power_snapshot(rec: dict) -> dict:
+def _dslog_power_snapshot(
+    rec: dict, profile_index_to_name: dict[int, str] | None = None
+) -> dict:
     """
     Collect all power-related fields exposed by dslogparser for one DSLog record.
     (Battery voltage is kept at the event level as battery_voltage.)
     """
-    currents = rec.get("pd_currents")
+    currents = rec.get("pd_currents") or []
+    pd_currents_dict = {
+        _channel_label(profile_index_to_name, i): round(float(a), 2)
+        for i, a in enumerate(currents)
+    }
     out = {
         "pd_id": rec.get("pd_id"),
         "pd_type": rec.get("pd_type"),
-        "pd_currents": [round(float(a), 2) for a in (currents or [])],
+        "pd_currents": pd_currents_dict,
         "pd_total_current": round(float(rec.get("pd_total_current", 0.0)), 2),
     }
     # Legacy CTRE PDP (DSLog v3): encoded auxiliary telemetry from the PDP block.
@@ -46,7 +114,11 @@ def _dslog_power_snapshot(rec: dict) -> dict:
     return out
 
 
-def parse_dslog(file_path: str, voltage_threshold: float = 6.3):
+def parse_dslog(
+    file_path: str,
+    voltage_threshold: float = 6.3,
+    profile_index_to_name: dict[int, str] | None = None,
+):
     """
     Analyzes an FRC DS log file for brownout-style events.
     Uses local dslogparser's DSLogParser.read_records() API.
@@ -78,12 +150,14 @@ def parse_dslog(file_path: str, voltage_threshold: float = 6.3):
                     if prev is not None and (float(round_trip_ms) - float(prev)) < 0.5:
                         continue
 
-            power = _dslog_power_snapshot(rec)
+            power = _dslog_power_snapshot(rec, profile_index_to_name)
             pd_currents_raw = rec.get("pd_currents") or []
             significant_loads = {}
             for idx, amps in enumerate(pd_currents_raw):
                 if amps > 15.0:
-                    significant_loads[f"channel_{idx}"] = round(float(amps), 2)
+                    significant_loads[_channel_label(profile_index_to_name, idx)] = (
+                        round(float(amps), 2)
+                    )
 
             brownout_events.append({
                 "timestamp": timestamp_str,
@@ -222,16 +296,46 @@ def get_gemini_diagnosis(log_data):
     return response.text
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("file")
+    parser = argparse.ArgumentParser(
+        description="Analyze FRC .dslog or .wpilog for brownout-style events."
+    )
+    parser.add_argument("file", help="Path to .dslog or .wpilog")
+    parser.add_argument(
+        "--dslog-profile",
+        metavar="XML",
+        help=(
+            "Driver Station profile XML (e.g. dslogprofiles22.xml). "
+            "When used with .dslog, names pd_currents keys from SeriesChildNode "
+            "<Name> (pdp0..pdp23); unlisted channels use pdp<N>."
+        ),
+    )
+    parser.add_argument(
+        "--profile-name",
+        metavar="NAME",
+        help=(
+            "GroupProfile <Name> to use when the XML contains multiple profiles "
+            "(default: first profile in file)."
+        ),
+    )
     args = parser.parse_args()
+    print(args)
+
+    profile_map: dict[int, str] | None = None
+    if args.dslog_profile:
+        try:
+            profile_map = load_dslog_profile_channel_names(
+                args.dslog_profile, args.profile_name
+            )
+        except (ET.ParseError, OSError, ValueError) as e:
+            print(f"Error loading dslog profile: {e}", file=sys.stderr)
+            sys.exit(1)
 
     ext = os.path.splitext(args.file)[1].lower()
-    
+
     if ext == ".wpilog":
         data = parse_wpilog(args.file)
     elif ext == ".dslog":
-        data = parse_dslog(args.file)
+        data = parse_dslog(args.file, profile_index_to_name=profile_map)
     else:
         print("Unsupported file format.")
         return
