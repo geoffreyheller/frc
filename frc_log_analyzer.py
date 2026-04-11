@@ -259,7 +259,9 @@ def get_gemini_diagnosis(log_data):
     """
     # Initialize the client. 
     # It automatically looks for the GEMINI_API_KEY environment variable.
-    client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+    api_key=os.environ.get("GOOGLE_API_KEY")
+
+    client = genai.Client(api_key=api_key)
 
     prompt_content = f"""
     Role: Act as a Lead FRC Control Systems Engineer and Mechanical Mentor. Your goal is to diagnose robot "brownouts" (voltage drops) from telemetry data.
@@ -286,12 +288,19 @@ def get_gemini_diagnosis(log_data):
     Data:
     {json.dumps(log_data, indent=2)}
     """
-    
-    # Use the newer model 'gemini-2.0-flash' for fast, efficient telemetry analysis
+
+    # print("List of models that support generateContent:\n")
+    # for m in client.models.list():
+    #     for action in m.supported_actions:
+    #         if action == "generateContent":
+    #             print(m.name)
+
     response = client.models.generate_content(
-        model="gemini-2.0-flash", 
+        model="gemini-3-flash-preview", 
         contents=prompt_content
     )
+
+
     
     return response.text
 
@@ -340,12 +349,13 @@ def main():
         print("Unsupported file format.")
         return
 
-    print(json.dumps(data, indent=2));
+    print(json.dumps(data, indent=2))
+    print(*"\nStarting Gemini diagnosis")
 
-    # if data["events"]:
-    #     print(get_gemini_diagnosis(data))
-    # else:
-    #     print("No issues detected.")
+    if data["events"]:
+        print(get_gemini_diagnosis(data))
+    else:
+        print("No issues detected.")
 
 if __name__ == "__main__":
     main()
